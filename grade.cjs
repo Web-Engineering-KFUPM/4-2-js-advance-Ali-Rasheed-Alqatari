@@ -12,9 +12,9 @@
  * Due date: 09/17/2025 11:59 PM Riyadh (UTC+03:00)
  *
  * IMPORTANT (late check):
- * - We grade lateness using the latest *student* commit (non-bot),
- *   NOT the latest workflow/GitHub Actions commit.
- * - We also include commit SHA + author/email in the feedback.
+ * - We grade lateness using the latest *student-work* commit:
+ *   - Excludes bot/workflow commits by author/message signals
+ *   - Excludes commits that ONLY modify autograder/workflow files (even if authored by an instructor)
  *
  * Status codes:
  * - 0 = on time
@@ -25,6 +25,10 @@
  * - artifacts/grade.csv  (structure unchanged)
  * - artifacts/feedback/README.md
  * - GitHub Actions Step Summary (GITHUB_STEP_SUMMARY)
+ *
+ * NOTE: In your workflow, make sure checkout uses full history:
+ *   uses: actions/checkout@v4
+ *   with: { fetch-depth: 0 }
  */
 
 const fs = require("fs");
@@ -39,7 +43,7 @@ const FEEDBACK_DIR = path.join(ARTIFACTS_DIR, "feedback");
 fs.mkdirSync(FEEDBACK_DIR, { recursive: true });
 fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
 
-/** Due date: 09/17/2025 11:59 PM Riyadh time (UTC+03:00) */
+/** Due date: 09/17/2025 11:59 PM Riyadh (UTC+03:00) */
 const DUE_ISO = "2025-09-17T23:59:00+03:00";
 const DUE_EPOCH_MS = Date.parse(DUE_ISO);
 
@@ -47,13 +51,10 @@ const DUE_EPOCH_MS = Date.parse(DUE_ISO);
 function getStudentId() {
   const repoFull = process.env.GITHUB_REPOSITORY || ""; // org/repo
   const repoName = repoFull.includes("/") ? repoFull.split("/")[1] : repoFull;
-
-  // Classroom repos often end with username
   const fromRepoSuffix =
     repoName && repoName.includes("-")
       ? repoName.split("-").slice(-1)[0]
       : "";
-
   return (
     process.env.STUDENT_USERNAME ||
     fromRepoSuffix ||
@@ -63,7 +64,7 @@ function getStudentId() {
   );
 }
 
-/** ---------- Git helpers: latest *student* commit time (exclude bots/workflows) ---------- */
+/** ---------- Git helpers: latest *student-work* commit time ---------- */
 const BOT_SIGNALS = [
   "[bot]",
   "github-actions",
@@ -73,21 +74,84 @@ const BOT_SIGNALS = [
   "dependabot",
   "autograding",
   "workflow",
+  "grader",
+  "autograder",
 ];
+
+const IGNORED_FILE_PREFIXES = [
+  ".github/workflows/",
+  "artifacts/",
+  "node_modules/",
+];
+
+const IGNORED_FILES_EXACT = new Set([
+  "grade.cjs",
+  "package.json",
+  "package-lock.json",
+  "grade.yml",
+  ".gitignore",
+]);
 
 function looksLikeBotCommit(hayLower) {
   return BOT_SIGNALS.some((s) => hayLower.includes(s));
 }
 
-function getLatestStudentCommitInfo() {
-  // Returns: { epochMs, iso, sha, author, email, subject, usedFallback, note }
+function isIgnoredPath(p) {
+  if (!p) return true;
+  if (IGNORED_FILES_EXACT.has(p)) return true;
+  return IGNORED_FILE_PREFIXES.some((pre) => p.startsWith(pre));
+}
+
+function getChangedFilesForCommit(sha) {
   try {
-    // Ensure we have enough history; if checkout is shallow, this may still be limited,
-    // but workflow should set fetch-depth: 0.
-    const out = execSync(
-      'git log --format=%H|%ct|%an|%ae|%s -n 500',
-      { stdio: ["ignore", "pipe", "ignore"] }
-    )
+    const out = execSync(`git diff-tree --no-commit-id --name-only -r ${sha}`, {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    if (!out) return [];
+    return out
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function getHeadCommitInfo() {
+  try {
+    const out = execSync("git log -1 --format=%H|%ct|%an|%ae|%s", {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+
+    if (!out) return null;
+
+    const [sha, ct, an, ae, ...subjParts] = out.split("|");
+    const seconds = Number(ct);
+    const epochMs = Number.isFinite(seconds) ? seconds * 1000 : null;
+
+    return {
+      sha: sha || "unknown",
+      epochMs,
+      iso: epochMs ? new Date(epochMs).toISOString() : "unknown",
+      author: an || "unknown",
+      email: ae || "unknown",
+      subject: subjParts.join("|") || "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getLatestStudentWorkCommitInfo() {
+  // Returns: { epochMs, iso, sha, author, email, subject, note }
+  try {
+    const out = execSync("git log --format=%H|%ct|%an|%ae|%s -n 800", {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
       .toString()
       .trim();
 
@@ -99,7 +163,6 @@ function getLatestStudentCommitInfo() {
         author: "unknown",
         email: "unknown",
         subject: "",
-        usedFallback: true,
         note: "git log returned no commits",
       };
     }
@@ -116,6 +179,13 @@ function getLatestStudentCommitInfo() {
       const hay = `${an} ${ae} ${subject}`.toLowerCase();
       if (looksLikeBotCommit(hay)) continue;
 
+      // Exclude commits that ONLY touch autograder/workflow infra
+      const changed = getChangedFilesForCommit(sha);
+      if (changed.length > 0) {
+        const hasStudentWorkChange = changed.some((f) => !isIgnoredPath(f));
+        if (!hasStudentWorkChange) continue;
+      }
+
       const seconds = Number(ct);
       if (!Number.isFinite(seconds)) continue;
 
@@ -127,45 +197,20 @@ function getLatestStudentCommitInfo() {
         author: an || "unknown",
         email: ae || "unknown",
         subject,
-        usedFallback: false,
-        note: "selected latest non-bot commit",
+        note: "selected latest non-bot commit that changes student work (ignores grader-only commits)",
       };
     }
 
-    // Fallback: latest commit if all appear bot-like
-    const fb = execSync('git log -1 --format=%H|%ct|%an|%ae|%s', {
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .toString()
-      .trim();
-
-    if (!fb) {
-      return {
-        epochMs: null,
-        iso: "unknown",
-        sha: "unknown",
-        author: "unknown",
-        email: "unknown",
-        subject: "",
-        usedFallback: true,
-        note: "fallback git log empty",
-      };
-    }
-
-    const p = fb.split("|");
-    const sha = p[0] || "unknown";
-    const seconds = Number(p[1]);
-    const epochMs = Number.isFinite(seconds) ? seconds * 1000 : null;
-
+    // Fallback to HEAD (best effort)
+    const head = getHeadCommitInfo();
     return {
-      epochMs,
-      iso: epochMs ? new Date(epochMs).toISOString() : "unknown",
-      sha,
-      author: p[2] || "unknown",
-      email: p[3] || "unknown",
-      subject: p.slice(4).join("|") || "",
-      usedFallback: true,
-      note: "all commits looked bot-like; using latest commit as fallback",
+      epochMs: head ? head.epochMs : null,
+      iso: head ? head.iso : "unknown",
+      sha: head ? head.sha : "unknown",
+      author: head ? head.author : "unknown",
+      email: head ? head.email : "unknown",
+      subject: head ? head.subject : "",
+      note: "fallback to HEAD (no student-work commit detected)",
     };
   } catch (e) {
     return {
@@ -175,16 +220,13 @@ function getLatestStudentCommitInfo() {
       author: "unknown",
       email: "unknown",
       subject: "",
-      usedFallback: true,
       note: `git inspection failed: ${String(e)}`,
     };
   }
 }
 
 function wasSubmittedLate(commitEpochMs) {
-  // If we cannot determine commit time, be conservative:
-  // treat as late ONLY if there is a submission; otherwise status=2 handles missing.
-  if (!commitEpochMs) return true;
+  if (!commitEpochMs) return false; // best-effort: don't penalize on unknown
   return commitEpochMs > DUE_EPOCH_MS;
 }
 
@@ -196,7 +238,6 @@ function readTextSafe(p) {
     return "";
   }
 }
-
 function stripHtmlComments(html) {
   return html.replace(/<!--[\s\S]*?-->/g, "");
 }
@@ -217,7 +258,6 @@ function resolveFromIndex(src, indexPath) {
 }
 
 function guessJsFileFromRepo() {
-  // prefer linked script if index.html exists
   const indexPath = "index.html";
   if (fs.existsSync(indexPath)) {
     const html = readTextSafe(indexPath);
@@ -235,13 +275,11 @@ function guessJsFileFromRepo() {
     }
   }
 
-  // common names
   const candidates = ["script.js", "app.js", "main.js", "index.js"];
   for (const c of candidates) {
     if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
   }
 
-  // any .js in root excluding grader files and node_modules/artifacts
   const entries = fs.readdirSync(".", { withFileTypes: true });
   for (const e of entries) {
     if (!e.isFile()) continue;
@@ -254,7 +292,7 @@ function guessJsFileFromRepo() {
   return null;
 }
 
-/** ---------- JS parsing helpers (lightweight / flexible heuristics) ---------- */
+/** ---------- JS parsing helpers ---------- */
 function stripJsComments(code) {
   return code
     .replace(/\/\*[\s\S]*?\*\//g, "")
@@ -274,13 +312,9 @@ function canCompileInVm(studentCode) {
     new vm.Script(`(function(){ ${studentCode} })();`);
     return { ok: true, error: null };
   } catch (e) {
-    return {
-      ok: false,
-      error: String(e && e.stack ? e.stack : e),
-    };
+    return { ok: false, error: String(e && e.stack ? e.stack : e) };
   }
 }
-
 function runInSandbox(studentCode, { postlude = "" } = {}) {
   const logs = [];
   const context = {
@@ -329,19 +363,14 @@ function scoreFromRequirements(reqs, maxMarks) {
   if (total === 0) return { earned: 0, ok, total };
   return { earned: Math.round((maxMarks * ok) / total), ok, total };
 }
-
 function req(label, ok, detailIfFail = "") {
   return { label, ok: !!ok, detailIfFail };
 }
-
 function formatReqs(reqs) {
   const lines = [];
   for (const r of reqs) {
     if (r.ok) lines.push(`- ✅ ${r.label}`);
-    else
-      lines.push(
-        `- ❌ ${r.label}${r.detailIfFail ? ` — ${r.detailIfFail}` : ""}`
-      );
+    else lines.push(`- ❌ ${r.label}${r.detailIfFail ? ` — ${r.detailIfFail}` : ""}`);
   }
   return lines;
 }
@@ -360,8 +389,10 @@ const jsNote = hasJs
   : "❌ No student JS file found in repository root (or index.html link).";
 
 /** ---------- Submission time + status ---------- */
-const commitInfo = getLatestStudentCommitInfo();
-const late = (!hasJs || jsEmpty) ? false : wasSubmittedLate(commitInfo.epochMs);
+const commitInfo = getLatestStudentWorkCommitInfo();
+const headInfo = getHeadCommitInfo();
+
+const late = hasJs && !jsEmpty ? wasSubmittedLate(commitInfo.epochMs) : false;
 
 let status = 0;
 if (!hasJs || jsEmpty) status = 2;
@@ -373,8 +404,8 @@ const submissionStatusText =
   status === 2
     ? "No submission detected (missing/empty JS): submission marks = 0/20."
     : status === 1
-      ? `Late submission via latest *student* commit: 10/20. (commit: ${commitInfo.sha} @ ${commitInfo.iso})`
-      : `On-time submission via latest *student* commit: 20/20. (commit: ${commitInfo.sha} @ ${commitInfo.iso})`;
+      ? `Late submission via latest *student-work* commit: 10/20. (commit: ${commitInfo.sha} @ ${commitInfo.iso})`
+      : `On-time submission via latest *student-work* commit: 20/20. (commit: ${commitInfo.sha} @ ${commitInfo.iso})`;
 
 /** ---------- Static analysis base ---------- */
 const cleanedCode = stripJsComments(jsCode);
@@ -385,12 +416,8 @@ let compileError = null;
 
 if (hasJs && !jsEmpty) {
   const cc = canCompileInVm(jsCode);
-  if (!cc.ok) {
-    compileError = cc.error;
-  } else {
-    // Export nothing critical; dynamic output is just a bonus signal
-    runGeneral = runInSandbox(jsCode);
-  }
+  if (!cc.ok) compileError = cc.error;
+  else runGeneral = runInSandbox(jsCode);
 }
 
 function logsContain(logs, re) {
@@ -402,12 +429,7 @@ function logsContain(logs, re) {
 function anyOfRegexes(code, regexes) {
   return regexes.some((re) => re.test(code));
 }
-
 function hasRangeValidationForGpa(code) {
-  // accepts patterns like:
-  // newGpa >= 0 && newGpa <= 4
-  // if (gpa < 0 || gpa > 4) throw ...
-  // Math.max(0, Math.min(4, x))
   return anyOfRegexes(code, [
     /\b(gpa|newGpa|value)\s*>=\s*0(\.0+)?\s*&&\s*(gpa|newGpa|value)\s*<=\s*4(\.0+)?/i,
     /\b(gpa|newGpa|value)\s*<\s*0(\.0+)?\s*\|\|\s*(gpa|newGpa|value)\s*>\s*4(\.0+)?/i,
@@ -426,16 +448,15 @@ const tasks = [
       const code = cleanedCode;
       const reqs = [];
 
-      // student object could be: object literal, class, or function constructor
       const hasStudentish =
         /\b(firstName|firstname)\b/.test(code) &&
         /\b(lastName|lastname)\b/.test(code) &&
         /\bgpa\b/.test(code);
 
       const hasGetter =
-        /\bget\s+fullName\s*\(/.test(code) || // class getter
-        /\bfullName\s*:\s*function\s*\(/.test(code) || // method
-        /\bfullName\s*\(\)\s*\{/.test(code); // shorthand method
+        /\bget\s+fullName\s*\(/.test(code) ||
+        /\bfullName\s*:\s*function\s*\(/.test(code) ||
+        /\bfullName\s*\(\)\s*\{/.test(code);
 
       const hasSetterOrUpdater =
         /\bset\s+gpa\s*\(/.test(code) ||
@@ -444,47 +465,16 @@ const tasks = [
 
       const hasValidation = hasRangeValidationForGpa(code);
 
-      const usesFullName =
-        /fullName\b/.test(code) && /console\.log\s*\(/.test(code);
+      const usesFullName = /fullName\b/.test(code) && /console\.log\s*\(/.test(code);
       const logsStudentAttrs =
         /console\.log\s*\([\s\S]*\b(firstName|lastName|gpa|fullName)\b/i.test(code) ||
         (runGeneral && logsContain(runGeneral.logs, /gpa|fullname|first/i));
 
-      reqs.push(
-        req(
-          "Defines a Student-like object/class with firstName, lastName, gpa",
-          hasStudentish,
-          "Include firstName, lastName, and gpa fields."
-        )
-      );
-      reqs.push(
-        req(
-          'Implements fullName getter/method returning "firstName lastName"',
-          hasGetter,
-          "Add a getter (get fullName()) or method fullName() that combines names."
-        )
-      );
-      reqs.push(
-        req(
-          "Has a GPA updater (setter or updateGpa method)",
-          hasSetterOrUpdater,
-          "Add a setter for gpa or a method like updateGpa(newGpa)."
-        )
-      );
-      reqs.push(
-        req(
-          "Validates GPA range 0.0–4.0",
-          hasValidation,
-          "Add checks for 0..4 (clamp or throw or conditional)."
-        )
-      );
-      reqs.push(
-        req(
-          "Creates an instance and outputs attributes (including via fullName)",
-          usesFullName || logsStudentAttrs,
-          "Create an instance and console.log fields (use fullName)."
-        )
-      );
+      reqs.push(req("Defines a Student-like object/class with firstName, lastName, gpa", hasStudentish));
+      reqs.push(req('Implements fullName getter/method returning "firstName lastName"', hasGetter));
+      reqs.push(req("Has a GPA updater (setter or updateGpa method)", hasSetterOrUpdater));
+      reqs.push(req("Validates GPA range 0.0–4.0", hasValidation));
+      reqs.push(req("Creates an instance and outputs attributes (including via fullName)", usesFullName || logsStudentAttrs));
 
       return reqs;
     },
@@ -504,19 +494,13 @@ const tasks = [
         /\bfor\s*\(\s*(const|let|var)?\s*\w+\s+in\s+\w+\s*\)/.test(code);
 
       const logsKeyValue =
-        /console\.log\s*\([\s\S]*\+\s*[\s\S]*\)/.test(code) || // concatenation
-        /console\.log\s*\(\s*\w+\s*,\s*\w+\s*\[\s*\w+\s*\]\s*\)/.test(code) || // k, obj[k]
-        /console\.log\s*\(\s*`\$\{\w+\}[\s\S]*\$\{\w+\[\w+\]\}.*`\s*\)/.test(code); // template literal
+        /console\.log\s*\([\s\S]*\+\s*[\s\S]*\)/.test(code) ||
+        /console\.log\s*\(\s*\w+\s*,\s*\w+\s*\[\s*\w+\s*\]\s*\)/.test(code) ||
+        /console\.log\s*\(\s*`\$\{\w+\}[\s\S]*\$\{\w+\[\w+\]\}.*`\s*\)/.test(code);
 
       reqs.push(req("Creates an object used as a key→value map", hasMapObject));
       reqs.push(req("Iterates over the map using for...in", hasForIn));
-      reqs.push(
-        req(
-          "Displays key and value during iteration",
-          logsKeyValue || (runGeneral && logsContain(runGeneral.logs, /:/)),
-          "Log both the key and its value (e.g., key + value)."
-        )
-      );
+      reqs.push(req("Displays key and value during iteration", logsKeyValue || (runGeneral && logsContain(runGeneral.logs, /:/))));
 
       return reqs;
     },
@@ -531,18 +515,17 @@ const tasks = [
 
       const hasString =
         /\b(new\s+String\s*\(|["'`][\s\S]*?["'`])/.test(code);
-
-      const usesCharAt = /\.charAt\s*\(\s*\d+/.test(code) || /\.charAt\s*\(\s*\w+/.test(code);
+      const usesCharAt = /\.charAt\s*\(\s*(\d+|\w+)\s*\)/.test(code);
       const usesLength = /\.length\b/.test(code);
 
-      const logsStringStuff =
-        /console\.log\s*\([\s\S]*charAt|length[\s\S]*\)/i.test(code) ||
+      const outputs =
+        /console\.log\s*\([\s\S]*(charAt|length)[\s\S]*\)/i.test(code) ||
         (runGeneral && logsContain(runGeneral.logs, /\b\d+\b/));
 
       reqs.push(req("Creates a string (plain or new String)", hasString));
       reqs.push(req("Uses .charAt(index)", usesCharAt));
       reqs.push(req("Uses .length", usesLength));
-      reqs.push(req("Outputs char(s) and length", logsStringStuff));
+      reqs.push(req("Outputs char(s) and length", outputs));
 
       return reqs;
     },
@@ -581,7 +564,6 @@ const tasks = [
       const code = cleanedCode;
       const reqs = [];
 
-      // 10 numbers: accept explicit 10 values OR a populated array length >= 10
       const hasArrayLiteral10 =
         /\[\s*[-]?\d+(\.\d+)?\s*(,\s*[-]?\d+(\.\d+)?\s*){9,}\]/.test(code);
 
@@ -597,13 +579,7 @@ const tasks = [
         /console\.log\s*\([\s\S]*Math\.(min|max)/.test(code) ||
         (runGeneral && logsContain(runGeneral.logs, /min|max/i));
 
-      reqs.push(
-        req(
-          "Declares an array with (about) 10 numbers",
-          hasArrayLiteral10 || /\bArray\s*\(\s*10\s*\)/.test(code) || /\bpush\s*\(/.test(code),
-          "Use an array with 10 numeric values (any values)."
-        )
-      );
+      reqs.push(req("Declares an array with (about) 10 numbers", hasArrayLiteral10 || /\bArray\s*\(\s*10\s*\)/.test(code) || /\bpush\s*\(/.test(code)));
       reqs.push(req("Uses spread with Math.min(...)", hasMinSpread));
       reqs.push(req("Uses spread with Math.max(...)", hasMaxSpread));
       reqs.push(req("Displays min and max", logsMinMax));
@@ -664,7 +640,6 @@ const tasks = [
         /new\s+RegExp\s*\(\s*["']ab["']/.test(code);
 
       const usesForEach = /\.forEach\s*\(\s*\(?\s*\w+/.test(code);
-
       const usesTest = /\.test\s*\(\s*\w+\s*\)/.test(code);
 
       const logsMatches =
@@ -696,13 +671,7 @@ const taskResults = tasks.map((t) => {
   const earnedSafe = status === 2 ? 0 : earned;
   earnedTasks += earnedSafe;
 
-  return {
-    id: t.id,
-    name: t.name,
-    earned: earnedSafe,
-    max: t.marks,
-    reqs,
-  };
+  return { id: t.id, name: t.name, earned: earnedSafe, max: t.marks, reqs };
 });
 
 const totalEarned = Math.min(earnedTasks + submissionMarks, 100);
@@ -716,11 +685,18 @@ let summary = `# Lab | ${LAB_NAME} | Autograding Summary
 - ${jsNote}
 - ${submissionStatusText}
 - Due (Riyadh): \`${DUE_ISO}\`
+
+- Repo HEAD commit:
+  - SHA: \`${headInfo ? headInfo.sha : "unknown"}\`
+  - Author: \`${headInfo ? headInfo.author : "unknown"}\` <${headInfo ? headInfo.email : "unknown"}>
+  - Time (UTC ISO): \`${headInfo ? headInfo.iso : "unknown"}\`
+
 - Chosen commit for submission timing:
   - SHA: \`${commitInfo.sha}\`
   - Author: \`${commitInfo.author}\` <${commitInfo.email}>
   - Time (UTC ISO): \`${commitInfo.iso}\`
   - Note: ${commitInfo.note}
+
 - Status: **${status}** (0=on time, 1=late, 2=no submission/empty)
 - Run: \`${now}\`
 
